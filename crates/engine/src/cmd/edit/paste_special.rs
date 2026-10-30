@@ -245,8 +245,9 @@ pub(super) fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
                     apply_operation(&op, &old, &mut new);
                 }
             }
-            // The copied cell's validation rule replaces whatever rule the destination had.
-            if !link && matches!(what, What::All | What::AllExceptBorders | What::Validation) {
+            // The copied cell's validation rule replaces whatever rule the destination had. Text
+            // from another app has no rules and leaves the destination's, as typing does.
+            if !link && !external && matches!(what, What::All | What::AllExceptBorders | What::Validation) {
                 let rule = src_sheet.validations.iter().find(|dv| dv.ranges.iter().any(|r| r.contains(sc))).cloned();
                 let sh = cx.sheet_mut(dest_sheet)?;
                 crate::cmd::data::remove_validation_cells(&mut sh.validations, &[RangeRef::new(dest, dest)]);

@@ -509,3 +509,37 @@ fn paste_special_pastes_cells_copied_in_another_window() {
     h.state_mut().run_or_alert("edit.pasteSpecial", json!({"what": "values"}));
     assert_eq!(value_at(&h, "B10"), Some(Value::number(2.0)));
 }
+
+#[test]
+fn paste_special_does_not_paste_a_moved_cut_again() {
+    // A cut pasted with Paste Special moves once; a second Paste Special doesn't paste the cut's
+    // text still on the system clipboard over the moved block.
+    let (clipboard, mut services) = system_clipboard("stale text from earlier");
+    let host = clipboard.clone();
+    services.copy_html = Some(Box::new(move |_, text| {
+        host.borrow_mut().0 = text.to_string();
+        Ok(())
+    }));
+    let mut h = harness(services);
+    h.state_mut().run("cell.set", json!({"cell": "B3", "input": "=B2*2"})).unwrap();
+    h.state_mut().run("selection.set", json!({"range": "A1:B3"})).unwrap();
+    h.run_steps(2);
+    for key in [egui::Key::F10, egui::Key::H, egui::Key::X] {
+        press(&mut h, key);
+    }
+    h.state_mut().run("selection.set", json!({"cell": "D4"})).unwrap();
+    h.state_mut().run_or_alert("edit.pasteSpecial", json!({"what": "all"}));
+    assert!(has_formula(&h, "E6"), "the cut moves the formula");
+    assert!(h.state().session.clipboard.is_none());
+
+    h.state_mut().run_or_alert("edit.pasteSpecial", json!({"what": "values"}));
+    assert!(has_formula(&h, "E6"), "a second Paste Special leaves the moved formula alone");
+    assert!(h.state().toast.is_some() || h.state().message.is_some(), "it reports there is nothing to paste");
+
+    // Text copied in another app afterwards still pastes.
+    dismiss(&mut h);
+    clipboard.borrow_mut().0 = "elsewhere\t7".into();
+    h.state_mut().run("selection.set", json!({"cell": "H1"})).unwrap();
+    h.state_mut().run_or_alert("edit.pasteSpecial", json!({"what": "values"}));
+    assert_eq!(value_at(&h, "I1"), Some(Value::number(7.0)));
+}

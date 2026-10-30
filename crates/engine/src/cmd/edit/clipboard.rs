@@ -1,8 +1,8 @@
 use super::cell::input_to_cell;
 use super::paste_special::paste_special;
 use super::{
-    Cell, CellRef, Clipboard, EngineError, Json, RangeRef, Result, Session, Value, cell_param_on, edit, json, ok, str_param, target_ranges,
-    target_sheet,
+    Cell, CellRef, Clipboard, EngineError, Json, RangeRef, Result, Session, Value, bool_param, cell_param_on, edit, json, ok, str_param,
+    target_ranges, target_sheet,
 };
 
 // ---------------------------------------------------------------- clipboard
@@ -212,20 +212,24 @@ fn text_cell(v: &str, sheet: usize, c: CellRef, wb: &mut gridcraft_model::Workbo
 /// The clipboard Paste Special works from: text from the system clipboard (`text`, with its
 /// `html` flavour) when the host passed text that isn't GridCraft's own copy, else GridCraft's.
 ///
-/// External text is entered into a scratch workbook as if typed at the destination, over the
-/// destination's own cell formats (so a Text-formatted cell keeps "007" as text, and pasting
-/// All keeps the destination's formatting, as pasting text does). The block sits where it will
-/// be pasted, so formulas in the text keep the references they were written with.
+/// External text is entered into a scratch workbook as if typed where each field will land, over
+/// that cell's own format (so a Text-formatted cell keeps "007" as text, and pasting All keeps
+/// the destination's formatting, as pasting text does). The block sits where it will be pasted,
+/// so formulas in the text keep the references they were written with; when there are formulas,
+/// the scratch workbook is a copy of the destination's, calculated, so pasting Values gives the
+/// results they would have there.
 pub(super) fn paste_source(s: &Session, p: &Json) -> Result<Clipboard> {
     let Some(text) = str_param(p, "text")
         .filter(|t| !t.is_empty() && s.clipboard.as_ref().is_none_or(|c| c.text.trim_end_matches(['\r', '\n']) != t.trim_end_matches(['\r', '\n'])))
     else {
         return s.clipboard.clone().ok_or_else(|| EngineError::Other("Nothing to paste.".into()));
     };
+    let too_large = || EngineError::Other("The copied text is too large for Paste Special; use Paste instead.".into());
     let sheet = target_sheet(s, p)?;
+    let transpose = bool_param(p, "transpose").unwrap_or(false);
     let d = s.doc()?;
     let at = cell_param_on(s, p, "at", sheet)?.unwrap_or(d.selection.current().start);
-    let rows = parse_tsv(text);
+    let rows = parse_tsv_bounded(text, PASTE_SPECIAL_TEXT_CELLS).ok_or_else(too_large)?;
     let h = rows.len();
     let w = rows.iter().map(Vec::len).max().unwrap_or(0);
     if h == 0 || w == 0 {
@@ -233,37 +237,63 @@ pub(super) fn paste_source(s: &Session, p: &Json) -> Result<Clipboard> {
     }
     // Every cell of the block is entered (ragged rows too), so its area is capped.
     if h.saturating_mul(w) > PASTE_SPECIAL_TEXT_CELLS {
-        return Err(EngineError::Other("The copied text is too large for Paste Special; use Paste instead.".into()));
+        return Err(too_large());
     }
     let html = str_param(p, "html").map(|html| crate::clip_html::table_cells(html, h, w)).unwrap_or_default();
     let dest = d.wb.sheet(sheet).ok_or(EngineError::NoDocument)?;
-    let mut wb = gridcraft_model::Workbook::new();
-    wb.styles = d.wb.styles.clone();
-    wb.date_system = d.wb.date_system;
-    for (ri, row) in rows.iter().enumerate() {
-        for ci in 0..w {
-            let Some(c) = at.offset(ri as i64, ci as i64) else { continue };
-            let style = dest.style_id(c);
-            if let Some(sh) = wb.sheet_mut(0) {
-                sh.set_cell(c, Cell { value: Value::Empty, formula: None, style });
-            }
-            let v = row.get(ci).map(String::as_str).unwrap_or_default();
-            let cell = text_cell(v, 0, c, &mut wb, html.get(ri).and_then(|r| r.get(ci)));
-            if let Some(sh) = wb.sheet_mut(0) {
-                match cell {
-                    Some(cell) => sh.set_cell(c, cell),
-                    None => {
-                        sh.remove_cell(c);
+    let fill = |wb: &mut gridcraft_model::Workbook| {
+        let mut formulas = false;
+        for (ri, row) in rows.iter().enumerate() {
+            for ci in 0..w {
+                let Some(c) = at.offset(ri as i64, ci as i64) else { continue };
+                // Transposed, the field lands at the mirrored cell: it is read with that cell's format.
+                let lands = if transpose { at.offset(ci as i64, ri as i64) } else { Some(c) };
+                let style = lands.map(|l| dest.style_id(l)).unwrap_or_default();
+                if let Some(sh) = wb.sheet_mut(sheet) {
+                    sh.set_cell(c, Cell { value: Value::Empty, formula: None, style });
+                }
+                let v = row.get(ci).map(String::as_str).unwrap_or_default();
+                let cell = text_cell(v, sheet, c, wb, html.get(ri).and_then(|r| r.get(ci)));
+                formulas |= cell.as_ref().is_some_and(|c| c.formula.is_some());
+                if let Some(sh) = wb.sheet_mut(sheet) {
+                    match cell {
+                        Some(cell) => sh.set_cell(c, cell),
+                        None => {
+                            sh.remove_cell(c);
+                        }
                     }
                 }
             }
+        }
+        formulas
+    };
+    // Without formulas, a workbook holding just the block (cheap); with them, the destination's.
+    let mut wb = gridcraft_model::Workbook::new();
+    wb.styles = d.wb.styles.clone();
+    wb.date_system = d.wb.date_system;
+    while wb.sheets.len() <= sheet {
+        wb.sheets.push(std::sync::Arc::new(gridcraft_model::Sheet::new(format!("Sheet{}", wb.sheets.len() + 1))));
+    }
+    if fill(&mut wb) {
+        wb = (*d.wb).clone();
+        fill(&mut wb);
+        gridcraft_calc::Calc::new().recalc_all(&mut wb);
+        // Text carries only cell contents: the destination's own notes, links, rules, merges,
+        // pictures and widths are not part of what's pasted.
+        if let Some(sh) = wb.sheet_mut(sheet) {
+            sh.comments.clear();
+            sh.hyperlinks.clear();
+            sh.validations.clear();
+            sh.merges.clear();
+            sh.cell_pictures.clear();
+            sh.cols.clear();
         }
     }
     let range = RangeRef::new(at, at.offset_clamped(h as i64 - 1, w as i64 - 1));
     // Uid 0 is never a document's, so styles are re-interned and nothing is moved as a cut.
     Ok(Clipboard {
         wb: std::sync::Arc::new(wb),
-        sheet: 0,
+        sheet,
         range,
         selected: range,
         cut: false,
@@ -297,6 +327,13 @@ fn numeric_from_html(cell: &mut Cell, field: &str, html: Option<&crate::clip_htm
 
 /// Tab-separated text with Excel-style quoting.
 pub(crate) fn parse_tsv(text: &str) -> Vec<Vec<String>> {
+    parse_tsv_bounded(text, usize::MAX).unwrap_or_default()
+}
+
+/// [`parse_tsv`] that gives up (`None`) once the text holds more than `max_fields` fields, before
+/// building the rest.
+pub(super) fn parse_tsv_bounded(text: &str, max_fields: usize) -> Option<Vec<Vec<String>>> {
+    let mut fields = 0usize;
     let mut rows = Vec::new();
     let mut row = Vec::new();
     let mut field = String::new();
@@ -323,11 +360,19 @@ pub(crate) fn parse_tsv(text: &str) -> Vec<Vec<String>> {
                 at_start = false;
             }
             '\t' => {
+                fields = fields.saturating_add(1);
+                if fields > max_fields {
+                    return None;
+                }
                 row.push(std::mem::take(&mut field));
                 at_start = true;
             }
             '\r' => {}
             '\n' => {
+                fields = fields.saturating_add(1);
+                if fields > max_fields {
+                    return None;
+                }
                 row.push(std::mem::take(&mut field));
                 rows.push(std::mem::take(&mut row));
                 at_start = true;
@@ -339,8 +384,11 @@ pub(crate) fn parse_tsv(text: &str) -> Vec<Vec<String>> {
         }
     }
     if !field.is_empty() || !row.is_empty() {
+        if fields >= max_fields {
+            return None;
+        }
         row.push(field);
         rows.push(row);
     }
-    rows
+    Some(rows)
 }

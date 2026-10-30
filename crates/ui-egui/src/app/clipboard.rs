@@ -68,6 +68,15 @@ impl SheetApp {
         if self.session.clipboard.is_some() && self.clipboard_text_at_copy.as_ref() == Some(&text) {
             return params;
         }
+        // A cut pastes once, as with Paste: its text left on the system clipboard isn't pasted
+        // again over the moved block.
+        if Self::same_clipboard_text(Some(&text), self.cut_text.as_deref()) {
+            if self.session.clipboard.is_none() {
+                return params;
+            }
+        } else {
+            self.cut_text = None;
+        }
         let html = self.services.paste_html.as_mut().and_then(|read| read());
         if let Some(p) = params.as_object_mut() {
             p.insert("text".into(), Json::String(text));
