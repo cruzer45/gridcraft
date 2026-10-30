@@ -482,3 +482,30 @@ fn the_cut_text_pastes_again_once_the_clipboard_has_held_other_text() {
     h.run_steps(2);
     assert_eq!(value_at(&h, "H1"), Some(Value::from("Name")), "the same text copied afresh pastes");
 }
+
+#[test]
+fn paste_special_pastes_cells_copied_in_another_window() {
+    // Copied in another spreadsheet window: only the system clipboard holds it.
+    let (_clipboard, services) = system_clipboard("x\t1\ny\t2\n");
+    let mut h = harness(services);
+    assert!(h.state().session.clipboard.is_none());
+    h.state_mut().run("selection.set", json!({"cell": "D4"})).unwrap();
+    h.state_mut().open_dialog("pasteSpecial", json!({}));
+    let d = h.state_mut().dialog.as_mut().unwrap();
+    d.values.insert("what".into(), json!("values"));
+    d.values.insert("transpose".into(), json!(true));
+    h.run_steps(2);
+    h.get_by_label("   OK   ").click();
+    h.run_steps(4);
+    assert!(h.state().message.is_none(), "{:?}", h.state().message);
+    assert!(h.state().dialog.is_none());
+    assert_eq!(value_at(&h, "D4"), Some(Value::from("x")));
+    assert_eq!(value_at(&h, "E4"), Some(Value::from("y")));
+    assert_eq!(value_at(&h, "D5"), Some(Value::number(1.0)));
+    assert_eq!(value_at(&h, "E5"), Some(Value::number(2.0)));
+
+    // The ribbon's Paste Values does the same.
+    h.state_mut().run("selection.set", json!({"cell": "A9"})).unwrap();
+    h.state_mut().run_or_alert("edit.pasteSpecial", json!({"what": "values"}));
+    assert_eq!(value_at(&h, "B10"), Some(Value::number(2.0)));
+}

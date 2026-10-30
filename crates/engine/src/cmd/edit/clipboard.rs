@@ -1,7 +1,8 @@
 use super::cell::input_to_cell;
 use super::paste_special::paste_special;
 use super::{
-    Cell, Clipboard, EngineError, Json, RangeRef, Result, Session, Value, cell_param_on, edit, json, ok, str_param, target_ranges, target_sheet,
+    Cell, CellRef, Clipboard, EngineError, Json, RangeRef, Result, Session, Value, cell_param_on, edit, json, ok, str_param, target_ranges,
+    target_sheet,
 };
 
 // ---------------------------------------------------------------- clipboard
@@ -176,10 +177,7 @@ fn paste_text(s: &mut Session, p: &Json, text: &str) -> Result<Json> {
         for (ri, row) in rows.iter().enumerate() {
             for (ci, v) in row.iter().enumerate() {
                 let Some(c) = at.offset(ri as i64, ci as i64) else { continue };
-                let mut cell = input_to_cell(v, sheet, c, &mut cx.wb).unwrap_or_else(|_| Some(Cell::value(Value::text(v.as_str()))));
-                if let Some(cl) = cell.as_mut() {
-                    numeric_from_html(cl, v, html.get(ri).and_then(|r| r.get(ci)), &mut cx.wb);
-                }
+                let cell = text_cell(v, sheet, c, &mut cx.wb, html.get(ri).and_then(|r| r.get(ci)));
                 let sh = cx.sheet_mut(sheet)?;
                 match cell {
                     Some(cell) => sh.set_cell(c, cell),
@@ -197,6 +195,83 @@ fn paste_text(s: &mut Session, p: &Json, text: &str) -> Result<Json> {
         Ok(())
     })?;
     Ok(json!({"rows": h, "cols": w}))
+}
+
+/// The most cells Paste Special enters from external text.
+const PASTE_SPECIAL_TEXT_CELLS: usize = 4_000_000;
+
+/// One tab-separated field entered at `c` as if typed there, with the number its HTML recorded.
+fn text_cell(v: &str, sheet: usize, c: CellRef, wb: &mut gridcraft_model::Workbook, html: Option<&crate::clip_html::HtmlCell>) -> Option<Cell> {
+    let mut cell = input_to_cell(v, sheet, c, wb).unwrap_or_else(|_| Some(Cell::value(Value::text(v))));
+    if let Some(cl) = cell.as_mut() {
+        numeric_from_html(cl, v, html, wb);
+    }
+    cell
+}
+
+/// The clipboard Paste Special works from: text from the system clipboard (`text`, with its
+/// `html` flavour) when the host passed text that isn't GridCraft's own copy, else GridCraft's.
+///
+/// External text is entered into a scratch workbook as if typed at the destination, over the
+/// destination's own cell formats (so a Text-formatted cell keeps "007" as text, and pasting
+/// All keeps the destination's formatting, as pasting text does). The block sits where it will
+/// be pasted, so formulas in the text keep the references they were written with.
+pub(super) fn paste_source(s: &Session, p: &Json) -> Result<Clipboard> {
+    let Some(text) = str_param(p, "text")
+        .filter(|t| !t.is_empty() && s.clipboard.as_ref().is_none_or(|c| c.text.trim_end_matches(['\r', '\n']) != t.trim_end_matches(['\r', '\n'])))
+    else {
+        return s.clipboard.clone().ok_or_else(|| EngineError::Other("Nothing to paste.".into()));
+    };
+    let sheet = target_sheet(s, p)?;
+    let d = s.doc()?;
+    let at = cell_param_on(s, p, "at", sheet)?.unwrap_or(d.selection.current().start);
+    let rows = parse_tsv(text);
+    let h = rows.len();
+    let w = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if h == 0 || w == 0 {
+        return Err(EngineError::Other("Nothing to paste.".into()));
+    }
+    // Every cell of the block is entered (ragged rows too), so its area is capped.
+    if h.saturating_mul(w) > PASTE_SPECIAL_TEXT_CELLS {
+        return Err(EngineError::Other("The copied text is too large for Paste Special; use Paste instead.".into()));
+    }
+    let html = str_param(p, "html").map(|html| crate::clip_html::table_cells(html, h, w)).unwrap_or_default();
+    let dest = d.wb.sheet(sheet).ok_or(EngineError::NoDocument)?;
+    let mut wb = gridcraft_model::Workbook::new();
+    wb.styles = d.wb.styles.clone();
+    wb.date_system = d.wb.date_system;
+    for (ri, row) in rows.iter().enumerate() {
+        for ci in 0..w {
+            let Some(c) = at.offset(ri as i64, ci as i64) else { continue };
+            let style = dest.style_id(c);
+            if let Some(sh) = wb.sheet_mut(0) {
+                sh.set_cell(c, Cell { value: Value::Empty, formula: None, style });
+            }
+            let v = row.get(ci).map(String::as_str).unwrap_or_default();
+            let cell = text_cell(v, 0, c, &mut wb, html.get(ri).and_then(|r| r.get(ci)));
+            if let Some(sh) = wb.sheet_mut(0) {
+                match cell {
+                    Some(cell) => sh.set_cell(c, cell),
+                    None => {
+                        sh.remove_cell(c);
+                    }
+                }
+            }
+        }
+    }
+    let range = RangeRef::new(at, at.offset_clamped(h as i64 - 1, w as i64 - 1));
+    // Uid 0 is never a document's, so styles are re-interned and nothing is moved as a cut.
+    Ok(Clipboard {
+        wb: std::sync::Arc::new(wb),
+        sheet: 0,
+        range,
+        selected: range,
+        cut: false,
+        doc_uid: 0,
+        text: text.to_string(),
+        areas: Vec::new(),
+        trust: d.trust,
+    })
 }
 
 /// A pasted cell that came out as text ("Rp10,000.00" isn't en-US input) becomes the number the

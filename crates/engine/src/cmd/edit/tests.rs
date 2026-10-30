@@ -303,3 +303,35 @@ fn replace_case_insensitive_keeps_text_when_folding_moves_boundaries() {
     let sh = s.doc().unwrap().wb.active().unwrap();
     assert_eq!(sh.value(CellRef::new(0, 0)), Value::text(text));
 }
+
+#[test]
+fn paste_special_pastes_text_from_another_app() {
+    let mut s = Session::new();
+    s.new_workbook();
+    let get = |s: &mut Session, a: &str| s.execute("cell.get", json!({"cell": a})).unwrap();
+    // Nothing copied anywhere: nothing to paste (and no panic).
+    assert!(s.execute("edit.pasteSpecial", json!({"what": "values"})).is_err());
+
+    // Values, transposed, over a bold destination cell that keeps its formatting.
+    s.execute("home.bold", json!({"range": "D4"})).unwrap();
+    s.execute("edit.pasteSpecial", json!({"what": "values", "transpose": true, "at": "D4", "text": "x\t1\ny\t2\n"})).unwrap();
+    assert_eq!(get(&mut s, "D4")["value"], "x");
+    assert_eq!(get(&mut s, "E4")["value"], "y");
+    assert_eq!(get(&mut s, "D5")["value"], json!(1.0));
+    assert_eq!(get(&mut s, "E5")["value"], json!(2.0));
+    s.execute("edit.pasteSpecial", json!({"what": "all", "at": "D4", "text": "z"})).unwrap();
+    assert_eq!(get(&mut s, "D4")["value"], "z");
+    assert_eq!(get(&mut s, "D4")["style"]["font"]["bold"], json!(true));
+
+    // An operation adds the copied numbers to what's there; blanks are skipped.
+    s.execute("edit.pasteSpecial", json!({"what": "values", "operation": "add", "skipBlanks": true, "at": "D5", "text": "10\t\n"})).unwrap();
+    assert_eq!(get(&mut s, "D5")["value"], json!(11.0));
+    assert_eq!(get(&mut s, "E5")["value"], json!(2.0));
+
+    // GridCraft's own copy wins over the same text; Paste Link can't link to text.
+    s.execute("cell.set", json!({"cell": "A1", "input": "=1+1"})).unwrap();
+    let copied = s.execute("edit.copy", json!({"range": "A1"})).unwrap();
+    s.execute("edit.pasteSpecial", json!({"what": "formulas", "at": "B1", "text": copied["text"]})).unwrap();
+    assert_eq!(get(&mut s, "B1")["formula"], "=1+1");
+    assert!(s.execute("edit.pasteSpecial", json!({"what": "all", "link": true, "at": "C1", "text": "other"})).is_err());
+}
